@@ -37,7 +37,6 @@ from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from trl.models import create_reference_model
-from trl.models import create_reference_model
 from open_r1.model import LazyInitMoEQwen2VLForConditionalGeneration
 
 
@@ -342,15 +341,18 @@ def main(script_args, training_args, model_args):
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
-        model=model_args.model_name_or_path,
+        model=model,
+        ref_model=ref_model,
         reward_funcs=reward_funcs,
-        args=training_args,
+        args=args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        processing_class=processing_class,
         peft_config=get_peft_config(model_args),
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
+        pad_token_id=pad_token_id,
     )
 
     # Train and push the model to the Hub
