@@ -15,11 +15,13 @@
 import copy
 import os
 import textwrap
+from copy import deepcopy
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.utils.data
+import deepspeed
 import transformers
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -40,12 +42,16 @@ from transformers import (
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
+from transformers.trainer_pt_utils import get_parameter_names
+from transformers.trainer import ALL_LAYERNORM_LAYERS
+from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
+from open_r1.model import EvalMoEQwen2VLForConditionalGeneration, MoEQwen2VLConfig
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
