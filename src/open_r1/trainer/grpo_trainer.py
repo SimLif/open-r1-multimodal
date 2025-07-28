@@ -331,6 +331,47 @@ class Qwen2VLGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+    def create_optimizer(self):
+        """
+        Overrides the default optimizer creation to support MoE models with DeepSpeed.
+        This method correctly handles both weight decay and MoE parameter grouping.
+        """
+        print("--- Running custom create_optimizer for MoE ---")
+        
+        # We will create the optimizer from scratch.
+        opt_model = self.model
+
+        # Get the names of parameters that should not have weight decay.
+        # This is the standard logic from Hugging Face Trainer.
+        decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
+        decay_parameters = [name for name in decay_parameters if "bias" not in name]
+
+        # It's crucial to convert the generator to a list ONCE to be able to iterate
+        # over it multiple times for creating the different groups.
+        named_params = list(opt_model.named_parameters())
+
+        # Step 1: Create parameter groups based on weight decay rules.
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in named_params if n in decay_parameters and p.requires_grad],
+                "weight_decay": self.args.weight_decay,
+                "name": "decay_parameters"
+            },
+            {
+                "params": [p for n, p in named_params if n not in decay_parameters and p.requires_grad],
+                "weight_decay": 0.0,
+                "name": "no_decay_parameters"
+            },
+        ]
+
+        # Step 2: Let DeepSpeed's utility further split these groups by MoE.
+        optimizer_grouped_parameters = split_params_into_different_moe_groups_for_optimizer(optimizer_grouped_parameters)
+
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return self.optimizer
+
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
