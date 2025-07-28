@@ -36,6 +36,8 @@ from transformers import (
 from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl.models import create_reference_model
+from trl.models import create_reference_model
 from open_r1.model import LazyInitMoEQwen2VLForConditionalGeneration
 
 
@@ -230,8 +232,111 @@ def main(script_args, training_args, model_args):
     if "image" in dataset[script_args.dataset_train_split].features:
         dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
     else:
-        dataset = dataset.map(make_conversation)
-        dataset = dataset.remove_columns("messages")
+        raise NotImplementedError("Only image-based datasets are supported for now.")
+        # dataset = dataset.map(make_conversation)
+        # dataset = dataset.remove_columns("messages")
+
+    args = training_args
+    model = model_args.model_name_or_path
+    peft_config=get_peft_config(model_args)
+    
+    # Args
+    if args is None:
+        model_name = model if isinstance(model, str) else model.config._name_or_path
+        model_name = model_name.split("/")[-1]
+        args = GRPOConfig(f"{model_name}-GRPO")
+
+    # Models
+    # Trained model
+    model_init_kwargs = args.model_init_kwargs or {}
+    model_init_kwargs["attn_implementation"] = model_args.attn_implementation
+    if isinstance(model, str):
+        model_id = model
+        torch_dtype = model_init_kwargs.get("torch_dtype")
+        if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+            pass  # torch_dtype is already a torch.dtype or "auto" or None
+        elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+            torch_dtype = getattr(torch, torch_dtype)
+            model_init_kwargs["torch_dtype"] = torch_dtype
+        else:
+            raise ValueError(
+                "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+            )
+        # Disable caching if gradient checkpointing is enabled (not supported)
+        model_init_kwargs["use_cache"] = (
+            False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+        )
+
+        if re.search(r'-\d+e\d*-', model_id):
+            model = LazyInitMoEQwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            for n, p in model.named_parameters():
+                if 'moe' in n or 'embed_tokens' in n:
+                    p.requires_grad = True
+                    print(f'{n}: {p.shape}')
+                else:
+                    p.requires_grad = False
+        elif "qwen2-vl" in model_id:
+            model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+        elif "Aria" in model_id:
+            model_init_kwargs.pop("use_cache")
+            model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+    else:
+        model_id = model.config._name_or_path
+        if args.model_init_kwargs is not None:
+            raise ValueError(
+                "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                "This argument can only be used when the `model` argument is a string."
+            )
+        
+    if peft_config is not None:
+        model = get_peft_model(model, peft_config)
+
+    # Reference model
+    if is_deepspeed_zero3_enabled():
+        if re.search(r'-\d+e\d*-', model_id):
+            raise ValueError("DeepSpeed ZeRO-3 is not supported for MoE models.")
+        elif "qwen2-vl" in model_id:
+            ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        elif "Aria" in model_id:
+            ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        else:
+            ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+    elif peft_config is None:
+        # If PEFT configuration is not provided, create a reference model based on the initial model.
+        if re.search(r'-\d+e\d*-', model_id):
+            ref_model = create_memory_efficient_reference_model(model)
+            ref_model.to(dtype=torch.bfloat16)
+        else:
+            ref_model = create_reference_model(model)
+    else:
+        # If PEFT is used, the reference model is not needed since the adapter can be disabled
+        # to revert to the initial model.
+        ref_model = None
+
+    # Processing class
+    if "qwen2-vl" in model_id or "Aria" in model_id:
+        processing_class = AutoProcessor.from_pretrained(model_id)
+        pad_token_id = processing_class.tokenizer.pad_token_id
+        processing_class.pad_token_id = pad_token_id
+        processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+        if "qwen2-vl" in model_id:
+            processing_class.image_processor.max_pixels = script_args.max_pixels
+            processing_class.image_processor.min_pixels = script_args.min_pixels
+    else:
+        processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+        pad_token_id = processing_class.pad_token_id
+
+    # Reward functions
+    if not isinstance(reward_funcs, list):
+        reward_funcs = [reward_funcs]
+    for i, reward_func in enumerate(reward_funcs):
+        if isinstance(reward_func, str):
+            reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                reward_func, num_labels=1, **model_init_kwargs
+            )
 
     trainer_cls = Qwen2VLGRPOTrainer
 
