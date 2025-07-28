@@ -214,7 +214,7 @@ def main(script_args, training_args, model_args):
             ],
         }
 
-    QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (number) in <answer> </answer> tags."
+    QUESTION_TEMPLATE = "{Question}  \nPlease analyze the image, question, and options, and then provide your final choice. Output the thinking process in <think> </think> and final answer (the letter of your choice, e.g., A, B, C, or D) in <answer> </answer> tags."
 
     def make_conversation_image(example):
         return {
@@ -223,7 +223,7 @@ def main(script_args, training_args, model_args):
                     "role": "user",
                     "content": [
                         {"type": "image"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
+                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["input"])},
                     ],
                 },
             ],
