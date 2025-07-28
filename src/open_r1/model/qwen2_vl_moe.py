@@ -6,12 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import deepspeed
 
 from transformers import DynamicCache, Cache
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, \
     _prepare_4d_causal_attention_mask_for_sdpa
 from transformers import Qwen2VLConfig, Qwen2VLModel, Qwen2VLForConditionalGeneration
+from transformers.utils.hub import cached_file
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -23,6 +25,8 @@ from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from transformers.models.qwen2_vl.modeling_qwen2_vl import logger
 from transformers.utils import ModelOutput
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
 local_rank = None
 
@@ -2118,6 +2122,226 @@ class EvalMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration)
     prepare_inputs_for_generation = Qwen2VLForConditionalGeneration.prepare_inputs_for_generation
     _get_image_nums_and_video_nums = Qwen2VLForConditionalGeneration._get_image_nums_and_video_nums
     _expand_inputs_for_generation = Qwen2VLForConditionalGeneration._expand_inputs_for_generation
+
+
+class LazyInitMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGeneration):
+    """
+    一个经过重构的模型类，支持 MoE 模块的延迟初始化。
+
+    工作流程:
+    1. `model = LazyInitMoEQwen2VLForConditionalGeneration(config)`: 创建一个标准的、密集的模型骨架。
+    2. `model.initialize_moe_modules()`: 在需要时调用此方法，将密集层转换为 MoE 层。
+    3. `model.load_state_dict(...)`: 加载包含 MoE 权重的 state_dict。
+    """
+    config_class = MoEQwen2VLConfig
+
+    def __init__(self, config):
+        """
+        构造函数现在非常干净。
+        它只负责调用父类的构造函数来构建一个标准的、没有 MoE 的模型。
+        """
+        super().__init__(config)
+        self._moe_initialized = False
+        print("LazyInitMoEModel: 基础模型骨架已创建。准备好进行 MoE 初始化。")
+
+    def initialize_moe_modules(self):
+        """
+        执行 MoE 模块的延迟初始化。
+        这段代码是从旧的 __init__ 方法中移动过来的。
+        """
+        if self._moe_initialized:
+            print("警告：MoE 模块已经被初始化，跳过。")
+            return
+
+        print("--- 开始执行 MoE 模块的延迟初始化 ---")
+
+        # 1. LoRA 适配器逻辑 (如果需要)
+        if getattr(self.config, 'lora', False) and self.config.lora.get('lora_enable', False):
+            from peft import LoraConfig, get_peft_model
+            pre_lora_config = self.config.lora
+            lora_config = LoraConfig(
+                r=pre_lora_config['lora_r'],
+                lora_alpha=pre_lora_config['lora_alpha'],
+                target_modules=pre_lora_config['target_modules'],
+                lora_dropout=pre_lora_config['lora_dropout'],
+                bias=pre_lora_config['lora_bias'],
+                task_type="CAUSAL_LM",
+            )
+            print("正在添加 LoRA 适配器...")
+            get_peft_model(self, lora_config)
+
+        # 2. MoE/MoNE 配置准备
+        self.router_aux_loss_coef = self.config.moe['router_aux_loss_coef']
+        num_layers = self.config.num_hidden_layers
+        moe_layers_idx = self.config.moe['moe_layers_idx']
+        mone_expert_type = self.config.mone.get('mone_expert_type', 'embedding_expert') if getattr(self.config, 'mone', False) else None
+        expert_cluster_mask_dict = self.config.mone.get('expert_cluster_mask_dict', None)
+
+        # 3. 遍历并替换为 MoE 层
+        print(f"准备在 {len(moe_layers_idx)} 个层上初始化 MoE 模块...")
+        for num_experts, layer_num in zip(self.config.moe.get('num_experts'), moe_layers_idx):
+            # 获取原始的 MLP 层，它的权重将被 MoE 专家复用
+            original_mlp = self.model.layers[layer_num].mlp
+            moe_layer = None
+
+            if getattr(self.config, 'mone', False):
+                mone_r = self.config.mone.get('mone_r', 2)
+                mone_dropout = self.config.mone.get('mone_dropout', 0.0)
+                
+                if mone_expert_type == 'small_expert':
+                    # 创建小专家实例
+                    small_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                    # 创建MoE层
+                    moe_layer = MoE(
+                        self.config.hidden_size,
+                        expert=small_expert,  # 使用小专家
+                        num_experts=num_experts,
+                        ep_size=self.config.moe.get('ep_size'),
+                        k=self.config.moe.get('top_k_experts'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_residual=self.config.moe.get('use_residual'),
+                    )
+                elif mone_expert_type == 'embedding_expert':
+                    moe_layer = EmbeddedMoELayer(
+                        hidden_size=self.config.hidden_size,
+                        num_experts=num_experts,  # 可设置为1M专家
+                        expert_dim=mone_r,        # 单神经元专家
+                        k=self.config.moe.get('top_k_experts'),
+                        gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_residual=self.config.moe.get('use_residual'),
+                        num_heads=self.config.mone.get('mone_num_heads', 1),       # 多头专家选择
+                        use_query_bn=self.config.mone.get('mone_use_query_bn', False),   # 使用批量归一化提高稳定性
+                        act_fn=self.config.mone.get('mone_act_fn', 'silu'),               # 可选: "relu", "gelu", "silu"
+                        dropout=self.config.mone.get('mone_dropout', 0.0),             # 专家 dropout 率
+                        use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),    # 是否使用专家门控
+                    )
+                elif mone_expert_type == 'dense_mask_expert':
+                    if expert_cluster_mask_dict is not None: 
+                        _expert_cluster_mask_list = expert_cluster_mask_dict[str(layer_num)]
+                        expert_cluster_mask_list = [] 
+                        for ele in _expert_cluster_mask_list:
+                            expert_cluster_mask = torch.zeros(1, num_experts)
+                            expert_cluster_mask[0, ele] = 1
+                            expert_cluster_mask_list.append(expert_cluster_mask.to(torch.bool))
+                    else:
+                        expert_cluster_mask_list = None
+                    moe_layer = DenseMaskMoE(
+                        self.config.hidden_size,
+                        expert_dim=mone_r,
+                        num_experts=num_experts,
+                        k=self.config.moe.get('top_k_experts'),
+                        capacity_factor=self.config.moe.get('capacity_factor'),
+                        eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                        min_capacity=self.config.moe.get('min_capacity'),
+                        use_expert_gate=self.config.mone.get('mone_use_expert_gate', False),
+                        gate_type=self.config.mone.get('mone_gate_type', 'token_gating'),
+                        expert_cluster_mask_list=expert_cluster_mask_list
+                    )
+                else:
+                    raise NotImplementedError(f"Unsupported expert type: {mone_expert_type}")
+            else:
+                # 标准 MoE 逻辑
+                print(f"  - 正在替换第 {layer_num} 层的 MLP 为标准 MoE 层...")
+                moe_layer = MoE(
+                    hidden_size=self.config.hidden_size,
+                    expert=original_mlp,  # <-- 关键：复用原始 MLP 作为专家模板
+                    num_experts=num_experts,
+                    ep_size=self.config.moe.get('ep_size'),
+                    k=self.config.moe.get('top_k_experts'),
+                    capacity_factor=self.config.moe.get('capacity_factor'),
+                    eval_capacity_factor=self.config.moe.get('eval_capacity_factor'),
+                    min_capacity=self.config.moe.get('min_capacity'),
+                    use_residual=self.config.moe.get('use_residual'),
+                )
+            
+            if self.config.moe.get('use_shared_experts', False):
+                print(f"self.config.moe.get('structure', 'new'),: {self.config.moe.get('structure', 'new')}")
+                if  self.config.moe.get('shared_expert_type', 'original') == 'small':
+                    shared_expert = SmallExpert(self.config.hidden_size, mone_r, mone_dropout)
+                else:
+                    shared_expert = original_mlp
+                moe_layer = CombinedLayer(
+                    shared_expert, 
+                    moe_layer, 
+                    self.config.moe.get('use_combined_gate', False),
+                    self.config.moe.get('combined_gate_type', False),
+                    self.config.moe.get('combined_gate_drop', False),
+                    self.config.hidden_size,
+                    structure=self.config.moe.get('structure', 'new'),
+                )
+            self.model.layers[layer_num].mlp = moe_layer
+
+        print(f"LLM num_layers: {num_layers}, MoE num_layers: {len(moe_layers_idx)}, where\n",
+            *[f'layer-{layer_num} has {num_experts} experts\n' for num_experts, layer_num in
+                zip(self.config.moe['num_experts'], moe_layers_idx)])
+
+        # 4. 替换 forward 方法以支持 MoE 的门控损失计算
+        print("正在替换 forward 方法以适配 MoE...")
+        for m in self.model.layers:
+            m.forward = MoEQwen2DecoderLayer_forward(m)
+        
+        self.model.forward = MoEQwen2VLModel_forward(self.model)
+        
+        self._moe_initialized = True
+        print("--- MoE 模块延迟初始化完成 ---")
+        print("最终模型结构:")
+        print(self.model)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """
+        重写的 from_pretrained 方法，集成了我们的延迟初始化逻辑。
+        """
+        print(f"--- 使用自定义的 from_pretrained 方法从 '{pretrained_model_name_or_path}' 加载模型 ---")
+
+        # 步骤 1: 加载配置
+        # trust_remote_code=True 对于 Qwen 这类模型是必需的
+        config = MoEQwen2VLConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+        config.vision_config.torch_dtype = config.torch_dtype
+
+        print("配置加载完成:", config)
+        print(f'vision_config: {config.vision_config}')
+
+        # 检查是否处于 ZeRO-3 环境
+        is_zero3 = is_deepspeed_zero3_enabled()
+        if is_zero3:
+            raise ValueError("MoE 模型不支持 ZeRO-3 优化。")
+
+        # 传统的初始化和加载流程 (适用于 ZeRO-2, 无DeepSpeed等)
+        else:
+            print("--- 步骤 1/3: 创建完整模型骨架 ---")
+            model = cls(config)
+            print("--- 步骤 2/3: 执行 MoE 初始化 ---")
+            model.initialize_moe_modules()
+
+            print("--- 打印模型参数 (检查点) ---")
+            for n, p in model.named_parameters():
+                print(f"Parameter: {n}, Shape: {p.shape}, Requires Grad: {p.requires_grad}")
+
+            print("--- 步骤 3/3: 加载完整权重 ---")
+            try:
+                model_file = cached_file(pretrained_model_name_or_path, "model.safetensors", _raise_exceptions_for_missing_entries=True)
+                from safetensors.torch import load_file
+                state_dict = load_file(model_file, device="cpu")
+            except (OSError, IOError):
+                model_file = cached_file(pretrained_model_name_or_path, "pytorch_model.bin", _raise_exceptions_for_missing_entries=True)
+                state_dict = torch.load(model_file, map_location="cpu")
+            
+            load_result = model.load_state_dict(state_dict, strict=True)
+            print("权重加载结果:", load_result)
+            
+        return model
+
+    # --- 保留其他必要的方法 ---
+    get_rope_index = MoEQwen2VLForConditionalGeneration.get_rope_index
+    prepare_inputs_for_generation = MoEQwen2VLForConditionalGeneration.prepare_inputs_for_generation
+    _get_image_nums_and_video_nums = MoEQwen2VLForConditionalGeneration._get_image_nums_and_video_nums
+    _expand_inputs_for_generation = MoEQwen2VLForConditionalGeneration._expand_inputs_for_generation
 
 
 # Register the new model with AutoConfig and AutoModel systems
