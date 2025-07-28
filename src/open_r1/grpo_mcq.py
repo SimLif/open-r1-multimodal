@@ -17,13 +17,107 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from copy import deepcopy
 
+import torch
 from datasets import load_dataset
+from transformers.utils import is_peft_available
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers import Qwen2VLForConditionalGeneration
-
+from transformers import (
+    AriaForConditionalGeneration,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedModel,
+    Qwen2VLForConditionalGeneration,
+)
 from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from open_r1.model import LazyInitMoEQwen2VLForConditionalGeneration
+
+
+if is_peft_available():
+    from peft import PeftConfig, get_peft_model
+
+
+def create_memory_efficient_reference_model(model: PreTrainedModel) -> PreTrainedModel:
+    """
+    Creates a memory-efficient reference model by sharing weights for all frozen parameters
+    and only creating copies for the trainable ones.
+
+    This is ideal for scenarios like partial fine-tuning where a large portion of the model is frozen.
+
+    Args:
+        model (PreTrainedModel): The trainable model, where some parameters have `requires_grad=False`.
+
+    Returns:
+        PreTrainedModel: A new model instance that acts as the reference model.
+    """
+    # 1. 创建一个与原模型结构相同但权重是随机初始化的“空壳”模型。
+    #    这是我们将要填充的目标。
+    print("Creating a memory-efficient reference model...")
+    ref_model = model.__class__(model.config)
+
+    if hasattr(ref_model, 'initialize_moe_modules') and callable(getattr(ref_model, 'initialize_moe_modules')):
+        print("  - Found and calling 'initialize_moe_modules' for the reference model.")
+        ref_model.initialize_moe_modules()
+
+    # 2. 遍历原模型的所有模块（例如，一个注意力层、一个MLP块等）。
+    #    我们将逐个模块地决定是共享还是复制。
+    for name, original_module in model.named_modules():
+        if not name:  # 跳过根模块本身
+            continue
+
+        # 3. 检查当前模块是否包含任何可训练的参数。
+        is_trainable_module = False
+        for param in original_module.parameters(recurse=False): # recurse=False 只检查当前模块的直接参数
+            if param.requires_grad:
+                is_trainable_module = True
+                break
+        
+        # 检查子模块中是否有可训练参数，因为一个block可能自身没参数，但子模块有
+        if not is_trainable_module:
+            for sub_param in original_module.parameters(recurse=True):
+                 if sub_param.requires_grad:
+                    is_trainable_module = True
+                    break
+
+        # 4. 根据模块是否可训练来决定策略
+        try:
+            path_parts = name.split('.')
+            parent_module_ref = ref_model
+            # 导航到 ref_model 中对应的父模块
+            for part in path_parts[:-1]:
+                parent_module_ref = getattr(parent_module_ref, part)
+            
+            module_name = path_parts[-1]
+
+            if is_trainable_module:
+                # 策略A：如果模块是可训练的，我们需要为 ref_model 创建一个独立的、冻结的副本。
+                # print(f"  - Copying trainable module: {name}")
+                copied_module = deepcopy(original_module)
+                # 确保副本中的所有参数都被冻结
+                for param in copied_module.parameters():
+                    param.requires_grad = False
+                setattr(parent_module_ref, module_name, copied_module)
+            else:
+                # 策略B：如果模块是完全冻结的，我们直接让 ref_model 引用原模型的模块。
+                # 这就是节省内存的关键步骤。
+                # print(f"  - Sharing frozen module: {name}")
+                setattr(parent_module_ref, module_name, original_module)
+
+        except AttributeError:
+            # 某些模块（如 Dropout）可能不存在于所有路径中，可以安全地跳过。
+            # print(f"  - Skipping module not found in ref_model: {name}")
+            continue
+
+    # 5. 确保整个 ref_model 处于评估模式
+    ref_model.eval()
+    print("Memory-efficient reference model created successfully.")
+    return ref_model
 
 
 @dataclass
