@@ -57,6 +57,46 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+def prepare_deepspeed_custom(model, accelerator):
+    # from trl.prepare_deepspeed
+    # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+    stage = config_kwargs["zero_optimization"]["stage"]
+
+    # Remove keys that trigger optimizer creation
+    config_kwargs.pop('bf16', None)
+    config_kwargs.pop('fp16', None)
+    config_kwargs.pop('optimizer', None)
+    config_kwargs.pop('scheduler', None)
+
+    if model is not None:
+        hidden_size = (
+            max(model.config.hidden_sizes)
+            if getattr(model.config, "hidden_sizes", None)
+            else getattr(model.config, "hidden_size", None)
+        )
+        if hidden_size is not None and stage == 3:
+            # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache
+            # @ step 0: expected module 1, but got module 0`
+            # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
+            config_kwargs.update(
+                {
+                    "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                    "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                    "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                }
+            )
+
+    # If ZeRO-3 is used, we shard both the active and reference model.
+    # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO
+    # disabled (stage 0)
+    if stage != 3:
+        config_kwargs["zero_optimization"]["stage"] = 0
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+    model.eval()
+    return model
+
 
 class Qwen2VLGRPOTrainer(Trainer):
     """
@@ -310,7 +350,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
-                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                self.ref_model = prepare_deepspeed_custom(self.ref_model, self.accelerator)
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
