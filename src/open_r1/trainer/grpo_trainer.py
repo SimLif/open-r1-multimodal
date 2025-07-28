@@ -232,6 +232,54 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
             return features
+        
+        # Statistics of the training dataset
+        # from tqdm import tqdm
+        # token_lengths = []
+        # image_token_lengths = []
+        # for inputs in tqdm(train_dataset, total=len(train_dataset)):
+        #     inputs = [inputs]
+        #     prompts = [x["prompt"] for x in inputs]
+        #     prompts_text = [maybe_apply_chat_template(example, processing_class)["prompt"] for example in inputs]
+        #     images = [x["image"] for x in inputs]
+        #     prompt_inputs = processing_class(
+        #         text=prompts_text,
+        #         images=images,
+        #         return_tensors="pt",
+        #         padding=True,
+        #         padding_side="left",
+        #         add_special_tokens=False,
+        #     )
+        #     # print(prompt_inputs)
+        #     input_len = prompt_inputs["input_ids"][0].size(0)
+
+        #     # 统计15165在prompt_inputs["input_ids"][0]的数量
+        #     image_token_num = prompt_inputs["input_ids"][0].tolist().count(151655)
+        #     # len_dict[input_len] = len_dict.get(input_len, 0) + 1
+        #     token_lengths.append(input_len)
+        #     image_token_lengths.append(image_token_num)
+        #     # len_dict[len(prompts_text)] = len_dict.get(len(prompts_text), 0) + 1
+        # # print(f"Length of prompts in the training dataset: {len_dict}")
+        # import numpy as np
+        # print("\n--- Prompt Token Length Statistics ---")
+        # print(f"Total samples: {len(token_lengths)}")
+        # print(f"Min length: {np.min(token_lengths)}")
+        # print(f"Max length: {np.max(token_lengths)}")
+        # print(f"Mean length: {np.mean(token_lengths):.2f}")
+        # print(f"Median length: {np.median(token_lengths)}")
+        # print(f"95th percentile: {np.percentile(token_lengths, 95):.2f}")
+        # print(f"99th percentile: {np.percentile(token_lengths, 99):.2f}")
+
+        # print("\n--- Image Token Length Statistics ---")
+        # print(f"Total samples: {len(image_token_lengths)}")
+        # print(f"Min length: {np.min(image_token_lengths)}")
+        # print(f"Max length: {np.max(image_token_lengths)}")
+        # print(f"Mean length: {np.mean(image_token_lengths):.2f}")
+        # print(f"Median length: {np.median(image_token_lengths)}")
+        # print(f"95th percentile: {np.percentile(image_token_lengths, 95):.2f}")
+        # print(f"99th percentile: {np.percentile(image_token_lengths, 99):.2f}")
+        # exit(0)
+            
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
