@@ -38,6 +38,7 @@ from open_r1.trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from trl.models import create_reference_model
 from open_r1.model import LazyInitMoEQwen2VLForConditionalGeneration
+from open_r1.utils import calculate_f1_single_ref
 
 
 if is_peft_available():
@@ -149,20 +150,28 @@ def accuracy_reward(completions, **kwargs):
     """Reward function that checks if the completion is correct using either symbolic verification or exact string matching."""
     contents = [completion[0]["content"] for completion in completions]
     labels  = kwargs['answer']
+    answer_types = kwargs.get('answer_type', 'multiple_choice')
 
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    for content, label in zip(contents, labels):
+    for content, label, answer_type in zip(contents, labels, answer_types):
         reward = 0.0
 
         try:
             # Extract answer from content if it has think/answer tags
-            content_match = re.search(r"<answer>(.*?)</answer>", content)
+            content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
             student_answer = content_match.group(1).strip() if content_match else content.strip()
 
-            # Compare the extracted answers
-            if student_answer == label:
-                reward = 1.0
+            student_answer_norm = student_answer.lower().replace(".", "").strip()
+            gt_ans_norm = str(label).lower().replace(".", "").strip()
+
+            if answer_type.lower() == 'closed' or answer_type.lower() == 'multiple_choice':
+                if student_answer_norm == gt_ans_norm:
+                    reward = 1.0
+            elif answer_type.lower() == 'open':
+                reward, _, _ = calculate_f1_single_ref(student_answer_norm, gt_ans_norm)
+            else:
+                raise ValueError(f"Invalid answer type: {answer_type}")
         except Exception:
             pass  # Keep reward as 0.0 if both methods fail
 
@@ -172,6 +181,7 @@ def accuracy_reward(completions, **kwargs):
             with open(log_path, "a") as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {content}\n")
+                f.write(f"Student answer: {student_answer}\n")
                 f.write(f"Label: {label}\n")
     return rewards
 
@@ -267,10 +277,10 @@ def main(script_args, training_args, model_args):
             False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
         )
 
-        if re.search(r'-\d+e\d*-', model_id):
+        if re.search(r'-\d+e\d*-', model_id) or 'moe' in model_id:
             model = LazyInitMoEQwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             for n, p in model.named_parameters():
-                if 'moe' in n or 'embed_tokens' in n:
+                if 'moe' in n or 'embed_tokens' in n or 'shared' in n:
                     p.requires_grad = True
                     print(f'{n}: {p.shape}')
                 else:
@@ -305,7 +315,7 @@ def main(script_args, training_args, model_args):
             ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
     elif peft_config is None:
         # If PEFT configuration is not provided, create a reference model based on the initial model.
-        if re.search(r'-\d+e\d*-', model_id):
+        if re.search(r'-\d+e\d*-', model_id) or 'moe' in model_id:
             ref_model = create_memory_efficient_reference_model(model)
             ref_model.to(dtype=torch.bfloat16)
         else:
