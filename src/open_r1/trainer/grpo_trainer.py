@@ -450,6 +450,16 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_length = prompt_inputs["input_ids"].size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
+        # # decode completions_ids and print them
+        # print(f'Prompts: {prompts}')
+        # for i, completion in enumerate(self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)):
+        #     if is_conversational(inputs[0]):
+        #         completion = [{"role": "assistant", "content": completion}]
+        #     else:
+        #         completion = {"prompt": prompts[i], "completion": completion}
+        #     # Print the generation number and the completion
+        #     print(f"Generation {i + 1}:\n{completion}\n")
+
         # Get the per-token log probabilities for the completions for the model and the reference model
         def get_per_token_logps(model, input_ids, **kwargs):
             logits = model(input_ids, **kwargs).logits  # (B, L, V)

@@ -32,8 +32,11 @@ export CUDA_VISIBLE_DEVICES=$GPUS
 export WANDB_PROJECT=med-moe-r1
 # export WANDB_API_KEY="<PLACEHOLDER_WANDB_KEY_2>"
 # export WANDB_RUN_NAME=Qwen-VL-2B-GRPO-$(date +%Y-%m-%d-%H-%M-%S)
-export WANDB_RUN_NAME=qwen2-vl-2b-moe-grpo-train_v2-ada-test
+export WANDB_RUN_NAME=qwen2-vl-2b-moe-4e2-ft-3vqa-r1v1-v2-lora-e5
+# export WANDB_RUN_NAME=qwen2-vl-2b-pmc-vqa-v2-test
 # wandb login $WANDB_API_KEY
+export DEBUG_MODE=true
+export LOG_PATH=/mnt/data/haoqiang/workspace/09-med-moe-r1/logs/${WANDB_RUN_NAME}
 
 cd ~/workspace/09-med-moe-r1
 # pip3 install vllm==0.6.6.post1
@@ -41,9 +44,18 @@ cd ~/workspace/09-med-moe-r1
 # pip3 install wandb==0.18.3
 
 # MODEL_PATH="/mnt/data/haoqiang/workspace/models/qwen2-vl-2b-instruct"
-# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-med-ada-5epoch"
+MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-med-ada-5epoch"
 # MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e-ada-1epoch"
-MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-r1-1epoch"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-r1-1epoch"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-ft-r1-1epoch"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/09-med-moe-r1/checkpoints/qwen2-vl-2b-grpo-train_v1"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/09-med-moe-r1/checkpoints/qwen2-vl-2b-moe-grpo-train_v2-ada"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/09-med-moe-r1/checkpoints/qwen2-vl-2b-moe-4e2-pmc-vqa-v2-warm"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ada-nano-ds-tok-share-1epoch"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-96e32-ada-1epoch"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-ft-r1-3vqa-1epoch-v2"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-ft-r1-3vqa-1epoch-v3"
+# MODEL_PATH="/mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-12e4-ft-r1-3vqa-1epoch"
 
 torchrun --nproc_per_node=2 \
     --master_port=29500 \
@@ -53,18 +65,24 @@ torchrun --nproc_per_node=2 \
     --model_name_or_path $MODEL_PATH \
     --torch_dtype bfloat16 \
     --model_init_kwargs '{"torch_dtype": "bfloat16"}' \
-    --dataset_name /mnt/data/haoqiang/workspace/data/medvqa-r1-pmc-vqa \
+    --dataset_name /mnt/data/haoqiang/workspace/data/medvqa-r1-3vqa \
     --dataset_train_split train_v2 \
     --max_prompt_length 1024 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --logging_steps 1 \
     --bf16 \
-    --report_to none \
+    --report_to wandb \
     --gradient_checkpointing true \
     --attn_implementation flash_attention_2 \
-    --max_pixels $((324 * 28 * 28)) \
+    --max_pixels $((576 * 28 * 28)) \
     --save_total_limit 8 \
     --num_train_epochs 1 \
     --run_name $WANDB_RUN_NAME \
-    --optim paged_adamw_8bit
+    --use_peft True \
+    --lora_r 128 \
+    --lora_alpha 256 \
+    --lora_weight_path /mnt/data/haoqiang/workspace/05-moe-llava/checkpoints/qwen2-vl-2b-instruct-4e2-ft-r1-3vqa-5epoch-v1-lora \
+    --lora_modules_to_save wg \
+    --lora_target_modules attn.qkv attn.proj mlp.fc1 mlp.fc2 merger.mlp.0 merger.mlp.2 q_proj k_proj v_proj o_proj up_proj down_proj gate_proj
+    # --optim paged_adamw_8bit

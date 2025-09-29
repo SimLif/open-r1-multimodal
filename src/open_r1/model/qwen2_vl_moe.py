@@ -27,6 +27,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import logger
 from transformers.utils import ModelOutput
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from peft import LoraConfig, get_peft_model
 
 local_rank = None
 
@@ -35,6 +36,19 @@ local_rank = None
 # except:
 #     pass
 TopKGateDynamic = None
+
+
+def find_all_linear_names(model, add_keywords=None):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            # rank0_print(f'>>>> {name}: {type(module)}')
+            continue
+        if 'lm_head' in name:
+            continue
+        lora_module_names.add(name)
+
+    return list(lora_module_names)
 
 
 def rank0_print(*args):
@@ -2316,24 +2330,43 @@ class LazyInitMoEQwen2VLForConditionalGeneration(MoEQwen2VLForConditionalGenerat
         else:
             print("--- 步骤 1/3: 创建完整模型骨架 ---")
             model = cls(config)
+
+            if kwargs.get('peft_config', None) is not None:
+                print("Adding LoRA adapters...")
+                peft_config = kwargs['peft_config']
+                if peft_config.target_modules is None:
+                    target_modules = find_all_linear_names(model)
+                    peft_config.target_modules = target_modules
+                model = get_peft_model(model, peft_config)
+
             print("--- 步骤 2/3: 执行 MoE 初始化 ---")
             model.initialize_moe_modules()
+            # print('Update target_modules for LoRA adapters...')
+            # new_target_modules = find_all_linear_names(model)
+            # new_target_modules = [n.replace('base_model.model.', '') for n in new_target_modules if 'lora' not in n]
+            # active_adapter = model.active_adapter
+            # model.peft_config[active_adapter].target_modules = list(new_target_modules)
+            # model.base_model.config.lora['target_modules'] = list(new_target_modules)
 
-            print("--- 打印模型参数 (检查点) ---")
-            for n, p in model.named_parameters():
-                print(f"Parameter: {n}, Shape: {p.shape}, Requires Grad: {p.requires_grad}")
+            # print("--- 打印模型参数 (检查点) ---")
+            # for n, p in model.named_parameters():
+            #     print(f"Parameter: {n}, Shape: {p.shape}, Requires Grad: {p.requires_grad}")
 
             print("--- 步骤 3/3: 加载完整权重 ---")
-            try:
-                model_file = cached_file(pretrained_model_name_or_path, "model.safetensors", _raise_exceptions_for_missing_entries=True)
-                from safetensors.torch import load_file
-                state_dict = load_file(model_file, device="cpu")
-            except (OSError, IOError):
-                model_file = cached_file(pretrained_model_name_or_path, "pytorch_model.bin", _raise_exceptions_for_missing_entries=True)
-                state_dict = torch.load(model_file, map_location="cpu")
+            # try:
+            #     model_file = cached_file(pretrained_model_name_or_path, "model.safetensors", _raise_exceptions_for_missing_entries=True)
+            #     from safetensors.torch import load_file
+            #     state_dict = load_file(model_file, device="cpu")
+            # except (OSError, IOError):
+            #     model_file = cached_file(pretrained_model_name_or_path, "pytorch_model.bin", _raise_exceptions_for_missing_entries=True)
+            #     state_dict = torch.load(model_file, map_location="cpu")
             
-            load_result = model.load_state_dict(state_dict, strict=True)
-            print("权重加载结果:", load_result)
+            # state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
+            # load_result = model.load_state_dict(state_dict, strict=False)
+            # missing_keys = load_result.missing_keys
+            # unexpected_keys = load_result.unexpected_keys
+            # print(f'Missing keys: {missing_keys}')
+            # print(f'Unexpected keys: {unexpected_keys}')
             
         return model
 

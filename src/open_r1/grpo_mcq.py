@@ -42,7 +42,7 @@ from open_r1.utils import calculate_f1_single_ref
 
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import PeftConfig, get_peft_model, PeftModel
 
 
 def create_memory_efficient_reference_model(model: PreTrainedModel) -> PreTrainedModel:
@@ -145,6 +145,11 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Minimum number of pixels for the image"},
     )
 
+    lora_weight_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the LORA weight file"},
+    )
+
 
 def accuracy_reward(completions, **kwargs):
     """Reward function that checks if the completion is correct using either symbolic verification or exact string matching."""
@@ -194,6 +199,18 @@ def format_reward(completions, **kwargs):
     return [1.0 if match else 0.0 for match in matches]
 
 
+def find_all_linear_names(model, add_keywords=None):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if 'lm_head' in name:
+            continue
+        lora_module_names.add(name)
+
+    return list(lora_module_names)
+
+
 reward_funcs_registry = {
     "accuracy": accuracy_reward,
     "format": format_reward,
@@ -223,7 +240,8 @@ def main(script_args, training_args, model_args):
             ],
         }
 
-    QUESTION_TEMPLATE = "{Question}  \nPlease analyze the image, question, and options, and then provide your final choice. Output the thinking process in <think> </think> and final answer (the letter of your choice, e.g., A, B, C, or D) in <answer> </answer> tags."
+    # QUESTION_TEMPLATE = "{Question}  \nPlease analyze the image, question, and options, and then provide your final choice. Output the thinking process in <think> </think> and final answer (the letter of your choice, e.g., A, B, C, or D) in <answer> </answer> tags."
+    QUESTION_TEMPLATE = "{Question}  \nPlease analyze the image and the question. First, present your thinking process within <think></think> tags. Then, provide a concise, direct answer within <answer></answer> tags."
 
     def make_conversation_image(example):
         return {
@@ -259,6 +277,8 @@ def main(script_args, training_args, model_args):
     # Trained model
     model_init_kwargs = args.model_init_kwargs or {}
     model_init_kwargs["attn_implementation"] = model_args.attn_implementation
+    if peft_config is not None:
+        model_init_kwargs["peft_config"] = peft_config
     if isinstance(model, str):
         model_id = model
         torch_dtype = model_init_kwargs.get("torch_dtype")
@@ -300,9 +320,55 @@ def main(script_args, training_args, model_args):
                 "This argument can only be used when the `model` argument is a string."
             )
         
-    if peft_config is not None:
-        model = get_peft_model(model, peft_config)
+    # load weight
+    # from safetensors.torch import load_file
+    # safetensors_path = '/mnt/data/haoqiang/workspace/09-med-moe-r1/checkpoints/qwen2-vl-2b-grpo-train_v1/model.safetensors'
+    # state_dict = load_file(safetensors_path)
+    # model.load_state_dict(state_dict, strict=False)
+    # print(f'---------------- Loaded model from {safetensors_path} ----------------')
 
+    if peft_config is not None:
+        # target_modules = find_all_linear_names(model)
+        # peft_config.target_modules = target_modules
+        # model = get_peft_model(model, peft_config)
+
+        if script_args.lora_weight_path is not None:
+            state_dict = torch.load(os.path.join(script_args.lora_weight_path, 'pytorch_model.bin'), map_location='cpu')
+            
+            # for n, p in model.named_parameters():
+            #     print(f'=====> {n}: {p.shape} ({p.requires_grad})')
+            
+            # for k, v in state_dict.items():
+            #     print(f'-----> {k}: {v.shape}')
+            
+            # state_dict_new = {}
+            # for k, v in state_dict.items():
+            #     k_new = f'base_model.model.{k}'
+            #     if 'lora' not in k_new and len(v.shape)==2:
+            #         k_new_list = k_new.split('.')
+            #         k_new = k_new_list[:-1] + ['base_layer'] + [k_new_list[-1]]
+            #         k_new = '.'.join(k_new)
+            #     state_dict_new[k_new] = v
+            # state_dict = state_dict_new
+            state_dict = {f'base_model.model.{k}': v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict, strict=True)
+
+            # for n, p in model.named_parameters():
+                # print(f'>>>> {n}: {p.shape} ({p.requires_grad})')
+            # exit(0)
+            # model.from_pretrained(script_args.lora_weight_path)
+            # model = PeftModel.from_pretrained(model, script_args.lora_weight_path) 
+            # print(f'---------------- Loaded LORA weight from {script_args.lora_weight_path} ----------------')
+            for n, p in model.named_parameters():
+                if ('lora' in n) or ('wg' in n):
+                    p.requires_grad = True
+                    print(f'--> {n}: {p.shape}')
+                else:
+                    p.requires_grad = False
+            # exit(0)
+            # for n, p in model.named_parameters():
+            #     if not p.requires_grad:
+            #         print(f'============= {n}: {p.shape}')
     # Reference model
     if is_deepspeed_zero3_enabled():
         if re.search(r'-\d+e\d*-', model_id):
